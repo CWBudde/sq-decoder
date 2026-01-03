@@ -13,6 +13,29 @@ endif ()
 
 add_subdirectory(${SMTG_VST3_SDK_PATH} ${CMAKE_BINARY_DIR}/vst3sdk)
 
+add_library(otfftpp STATIC
+  external/otfftpp/src/otfft.cpp
+  external/otfftpp/src/otfft_algo.cpp
+  external/otfftpp/src/otfft_algo_dif16.cpp
+  external/otfftpp/src/otfft_algo_dif4.cpp
+  external/otfftpp/src/otfft_algo_dif8.cpp
+  external/otfftpp/src/otfft_algo_dit16.cpp
+  external/otfftpp/src/otfft_algo_dit4.cpp
+  external/otfftpp/src/otfft_algo_dit8.cpp
+  external/otfftpp/src/otfft_algo_mixed.cpp
+  external/otfftpp/src/otfft_algo_sixstep.cpp
+)
+
+target_include_directories(otfftpp PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/external/otfftpp/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/external/simde
+)
+
+target_compile_definitions(otfftpp PRIVATE DO_SINGLE_THREAD=1 USE_UNALIGNED_MEMORY=1)
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(otfftpp PRIVATE -fno-math-errno)
+endif ()
+
 smtg_add_vst3plugin(SQDecoder
   source/sqdecoder_entry.cpp
   source/sqdecoder_processor.cpp
@@ -20,6 +43,7 @@ smtg_add_vst3plugin(SQDecoder
 )
 
 target_include_directories(SQDecoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/source)
+target_link_libraries(SQDecoder PRIVATE otfftpp)
 
 if (COMMAND smtg_set_bundle_name)
   smtg_set_bundle_name(SQDecoder "SQ Decoder")

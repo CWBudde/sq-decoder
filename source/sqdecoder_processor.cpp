@@ -2,19 +2,156 @@
 
 #include "sqdecoder_shared.h"
 
-#include "base/source/fstreamer.h"
-#include "pluginterfaces/base/ibstream.h"
-#include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "pluginterfaces/vst/vstaudioprocessor.h"
+
+#include "otfftpp/otfft.h"
+
+#include <algorithm>
+#include <cmath>
+#include <vector>
 
 namespace SQDecoder {
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
+constexpr int kBlockSize = 1024;
+constexpr int kHopSize = 512;
+constexpr double kSqrt2Over2 = 0.7071067811865475;
+constexpr double kPi = 3.14159265358979323846;
+
+class HilbertTransformer {
+public:
+  HilbertTransformer()
+      : fft_(kBlockSize),
+        window_(kBlockSize),
+        input_block_(kBlockSize, 0.0),
+        output_accum_(kBlockSize, 0.0),
+        fft_buffer_(kBlockSize),
+        out_queue_(kBlockSize, 0.0),
+        out_head_(0),
+        out_tail_(0),
+        out_count_(0),
+        in_fill_(0)
+  {
+    buildWindow();
+  }
+
+  void reset()
+  {
+    std::fill(input_block_.begin(), input_block_.end(), 0.0);
+    std::fill(output_accum_.begin(), output_accum_.end(), 0.0);
+    out_head_ = 0;
+    out_tail_ = 0;
+    out_count_ = 0;
+    in_fill_ = 0;
+  }
+
+  double processSample(double input)
+  {
+    if (in_fill_ < kBlockSize) {
+      input_block_[in_fill_++] = input;
+    }
+
+    if (in_fill_ == kBlockSize) {
+      processBlock();
+      std::move(input_block_.begin() + kHopSize, input_block_.end(), input_block_.begin());
+      std::fill(input_block_.end() - kHopSize, input_block_.end(), 0.0);
+      in_fill_ = kBlockSize - kHopSize;
+    }
+
+    if (out_count_ > 0) {
+      double output = out_queue_[out_head_];
+      out_head_ = (out_head_ + 1) % out_queue_.size();
+      --out_count_;
+      return output;
+    }
+
+    return 0.0;
+  }
+
+private:
+  void buildWindow()
+  {
+    for (int i = 0; i < kBlockSize; ++i) {
+      const double phase = 2.0 * kPi * static_cast<double>(i) / static_cast<double>(kBlockSize - 1);
+      const double hann = 0.5 - 0.5 * std::cos(phase);
+      window_[i] = std::sqrt(hann);
+    }
+  }
+
+  void processBlock()
+  {
+    for (int i = 0; i < kBlockSize; ++i) {
+      fft_buffer_[i].Re = input_block_[i] * window_[i];
+      fft_buffer_[i].Im = 0.0;
+    }
+
+    fft_.fwd(fft_buffer_.data());
+
+    fft_buffer_[0].Re = 0.0;
+    fft_buffer_[0].Im = 0.0;
+
+    const int nyquist = kBlockSize / 2;
+    fft_buffer_[nyquist].Re = 0.0;
+    fft_buffer_[nyquist].Im = 0.0;
+
+    for (int i = 1; i < nyquist; ++i) {
+      const double re = fft_buffer_[i].Re;
+      const double im = fft_buffer_[i].Im;
+      fft_buffer_[i].Re = im;
+      fft_buffer_[i].Im = -re;
+    }
+
+    for (int i = nyquist + 1; i < kBlockSize; ++i) {
+      const double re = fft_buffer_[i].Re;
+      const double im = fft_buffer_[i].Im;
+      fft_buffer_[i].Re = -im;
+      fft_buffer_[i].Im = re;
+    }
+
+    fft_.inv(fft_buffer_.data());
+
+    for (int i = 0; i < kBlockSize; ++i) {
+      output_accum_[i] += fft_buffer_[i].Re * window_[i];
+    }
+
+    for (int i = 0; i < kHopSize; ++i) {
+      pushOutput(output_accum_[i]);
+    }
+
+    std::move(output_accum_.begin() + kHopSize, output_accum_.end(), output_accum_.begin());
+    std::fill(output_accum_.end() - kHopSize, output_accum_.end(), 0.0);
+  }
+
+  void pushOutput(double value)
+  {
+    if (out_count_ >= static_cast<int>(out_queue_.size())) {
+      return;
+    }
+
+    out_queue_[out_tail_] = value;
+    out_tail_ = (out_tail_ + 1) % out_queue_.size();
+    ++out_count_;
+  }
+
+  OTFFT::FFT fft_;
+  std::vector<double> window_;
+  std::vector<double> input_block_;
+  std::vector<double> output_accum_;
+  std::vector<OTFFT::complex_t> fft_buffer_;
+  std::vector<double> out_queue_;
+  size_t out_head_;
+  size_t out_tail_;
+  int out_count_;
+  int in_fill_;
+};
+
 SQDecoderProcessor::SQDecoderProcessor()
 {
   setControllerClass(kSQDecoderControllerUID);
+  hilbert_left_ = std::make_unique<HilbertTransformer>();
+  hilbert_right_ = std::make_unique<HilbertTransformer>();
 }
 
 Steinberg::tresult PLUGIN_API SQDecoderProcessor::initialize(Steinberg::FUnknown* context)
@@ -26,61 +163,31 @@ Steinberg::tresult PLUGIN_API SQDecoderProcessor::initialize(Steinberg::FUnknown
 
   addAudioInput(STR16("Input"), SpeakerArr::kStereo);
   addAudioOutput(STR16("Output"), SpeakerArr::kQuadraphonic);
+  setLatencySamples(kBlockSize);
 
   return kResultOk;
 }
 
+Steinberg::tresult PLUGIN_API SQDecoderProcessor::setActive(Steinberg::TBool state)
+{
+  if (state && hilbert_left_ && hilbert_right_) {
+    hilbert_left_->reset();
+    hilbert_right_->reset();
+  }
+
+  return AudioEffect::setActive(state);
+}
+
 Steinberg::tresult PLUGIN_API SQDecoderProcessor::setState(Steinberg::IBStream* state)
 {
-  if (!state) {
-    return kResultFalse;
-  }
-
-  IBStreamer streamer(state, kLittleEndian);
-  float sep = 1.0f;
-  if (streamer.readFloat(sep)) {
-    separation_ = sep;
-  }
-
+  (void)state;
   return kResultOk;
 }
 
 Steinberg::tresult PLUGIN_API SQDecoderProcessor::getState(Steinberg::IBStream* state)
 {
-  if (!state) {
-    return kResultFalse;
-  }
-
-  IBStreamer streamer(state, kLittleEndian);
-  streamer.writeFloat(separation_);
-
+  (void)state;
   return kResultOk;
-}
-
-void SQDecoderProcessor::applyParameterChanges(ProcessData& data)
-{
-  IParameterChanges* changes = data.inputParameterChanges;
-  if (!changes) {
-    return;
-  }
-
-  const int32 count = changes->getParameterCount();
-  for (int32 i = 0; i < count; ++i) {
-    IParamValueQueue* queue = changes->getParameterData(i);
-    if (!queue) {
-      continue;
-    }
-
-    if (queue->getParameterId() != kParamSeparation) {
-      continue;
-    }
-
-    int32 sampleOffset = 0;
-    ParamValue value = 0.0;
-    if (queue->getPoint(queue->getPointCount() - 1, sampleOffset, value) == kResultTrue) {
-      separation_ = static_cast<float>(value);
-    }
-  }
 }
 
 template <typename SampleType>
@@ -88,38 +195,35 @@ static void processSamples(const SampleType* inL,
                            const SampleType* inR,
                            SampleType* outLF,
                            SampleType* outRF,
-                           SampleType* outLR,
-                           SampleType* outRR,
+                           SampleType* outLB,
+                           SampleType* outRB,
                            int32 sampleFrames,
-                           float separation)
+                           HilbertTransformer& hilbertL,
+                           HilbertTransformer& hilbertR)
 {
-  const SampleType k = static_cast<SampleType>(0.70710678f);
-  const SampleType sep = static_cast<SampleType>(separation);
-
   for (int32 i = 0; i < sampleFrames; ++i) {
-    const SampleType l = inL[i];
-    const SampleType r = inR[i];
+    const double lt = static_cast<double>(inL[i]);
+    const double rt = static_cast<double>(inR[i]);
+    const double hlt = hilbertL.processSample(lt);
+    const double hrt = hilbertR.processSample(rt);
 
-    const SampleType lf0 = l;
-    const SampleType rf0 = r;
-    const SampleType lr0 = l;
-    const SampleType rr0 = r;
+    const double lf = lt;
+    const double rf = rt;
+    const double lb = kSqrt2Over2 * (hlt - rt);
+    const double rb = kSqrt2Over2 * (lt - hrt);
 
-    const SampleType lf = l + k * r;
-    const SampleType rf = r + k * l;
-    const SampleType lr = l - k * r;
-    const SampleType rr = r - k * l;
-
-    outLF[i] = lf0 + sep * (lf - lf0);
-    outRF[i] = rf0 + sep * (rf - rf0);
-    outLR[i] = lr0 + sep * (lr - lr0);
-    outRR[i] = rr0 + sep * (rr - rr0);
+    outLF[i] = static_cast<SampleType>(lf);
+    outRF[i] = static_cast<SampleType>(rf);
+    outLB[i] = static_cast<SampleType>(lb);
+    outRB[i] = static_cast<SampleType>(rb);
   }
 }
 
 Steinberg::tresult PLUGIN_API SQDecoderProcessor::process(Steinberg::Vst::ProcessData& data)
 {
-  applyParameterChanges(data);
+  if (!hilbert_left_ || !hilbert_right_) {
+    return kResultOk;
+  }
 
   if (data.numInputs < 1 || data.numOutputs < 1) {
     return kResultOk;
@@ -137,7 +241,8 @@ Steinberg::tresult PLUGIN_API SQDecoderProcessor::process(Steinberg::Vst::Proces
     auto** in = data.inputs[0].channelBuffers32;
     auto** out = data.outputs[0].channelBuffers32;
 
-    processSamples(in[0], in[1], out[0], out[1], out[2], out[3], data.numSamples, separation_);
+    processSamples(in[0], in[1], out[0], out[1], out[2], out[3], data.numSamples,
+                   *hilbert_left_, *hilbert_right_);
     return kResultOk;
   }
 
@@ -145,7 +250,8 @@ Steinberg::tresult PLUGIN_API SQDecoderProcessor::process(Steinberg::Vst::Proces
     auto** in = data.inputs[0].channelBuffers64;
     auto** out = data.outputs[0].channelBuffers64;
 
-    processSamples(in[0], in[1], out[0], out[1], out[2], out[3], data.numSamples, separation_);
+    processSamples(in[0], in[1], out[0], out[1], out[2], out[3], data.numSamples,
+                   *hilbert_left_, *hilbert_right_);
     return kResultOk;
   }
 

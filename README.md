@@ -4,8 +4,12 @@ Minimal VST3 plugin scaffold that decodes stereo SQ-encoded material to 4-channe
 
 ## Setup
 
-1. Clone the VST3 SDK into `external/vst3sdk`:
-   - https://github.com/steinbergmedia/vst3sdk
+1. Initialize submodules:
+
+```sh
+git submodule update --init --recursive
+```
+
 2. Configure and build:
 
 ```sh

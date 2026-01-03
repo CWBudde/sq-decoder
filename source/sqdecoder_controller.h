@@ -13,7 +13,6 @@ public:
     return static_cast<Steinberg::Vst::IEditController*>(new SQDecoderController());
   }
 
-  Steinberg::tresult PLUGIN_API initialize(Steinberg::FUnknown* context) override;
   Steinberg::tresult PLUGIN_API setState(Steinberg::IBStream* state) override;
   Steinberg::tresult PLUGIN_API getState(Steinberg::IBStream* state) override;
 };

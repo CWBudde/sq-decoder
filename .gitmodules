@@ -1,0 +1,9 @@
+[submodule "external/vst3sdk"]
+	path = external/vst3sdk
+	url = https://github.com/steinbergmedia/vst3sdk
+[submodule "external/otfftpp"]
+	path = external/otfftpp
+	url = https://github.com/robinchrist/otfftpp
+[submodule "external/simde"]
+	path = external/simde
+	url = https://github.com/simd-everywhere/simde
